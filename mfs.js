@@ -78,6 +78,80 @@ var mfs = (function($){
 					);
 				},
 
+var mfs = (function($){
+	var manageFileStorage = function(options){
+		options = (options) ? options : {};
+
+		options.typeOfStorage = ('typeOfStorage' in options && typeof options.typeOfStorage == 'number')
+			? options.typeOfStorage
+			: window.TEMPORARY;
+
+		options.typeOfStorage = (options.typeOfStorage == window.TEMPORARY)
+			? options.typeOfStorage
+			: window.PERSISTENT;
+
+		options._storageEngine = (options.typeOfStorage == window.PERSISTENT)
+			? 'webkitPersistentStorage'
+			: 'webkitTemporaryStorage';
+
+		window.requestFileSystem = window.requestFileSystem
+			|| window.webkitRequestFileSystem;
+
+		window.resolveLocalFileSystemURL = window.resolveLocalFileSystemURL
+			|| window.webkitResolveLocalFileSystemURL;
+
+		var _mfs = {
+			/**
+			 *
+			 **/
+				_fs: null,
+
+			/**
+			 *
+			 **/
+				_storageEngine: 'webkitTemporaryStorage',
+
+			/**
+			 * In megabytes
+			 **/
+				requestedQuota: 0,
+
+			/**
+			 *
+			 **/
+				typeOfStorage: window.TEMPORARY,
+
+			/**
+			 * webkitPersistentStorage retorna cero grantedBytes cuando no se ha
+			 * solicitado permisos al usuario
+			 *
+			 * webkitTemporaryStorage retorna la cantidad maxima de bytes dispo-
+			 * nibles para la app
+			**/
+				_checkQuota: function(){
+					if ( typeof navigator[_mfs._storageEngine] == 'undefined' ) {
+						return;
+					}
+
+					navigator[_mfs._storageEngine].queryUsageAndQuota( 
+						function(usedBytes, grantedBytes) {
+							if ( grantedBytes === 0 ) {
+								_mfs._requestQuota(_mfs.requestedQuota);
+								return;
+							}
+
+							var usedMb = (usedBytes > 0) ? usedBytes / 1024 / 1024 : 0;
+							$(_mfs).trigger('mfs.requestQuota.success', [
+								grantedBytes / 1024 / 1024,
+								usedMb
+							]);
+						}, 
+						function(e) {
+							$(_mfs).trigger('mfs.requestQuota.error', [e]);
+						}
+					);
+				},
+
 			/**
 			 *
 			 **/
@@ -219,32 +293,36 @@ var mfs = (function($){
 			},
 
 			_saveFile: function(filename, fileContent, fileType){
-				var deferred = new $.Deferred();
+				var _deferred = new $.Deferred();
 				_mfs._fs.root.getFile(filename, {create: true}, function(f){
 					// f.isFile, f.name, f.fullPath, f.toURL()
 					f.createWriter(function(writer){
 						writer.onwriteend = function(e){
 							$(_mfs).trigger('mfs.saveFile.success', [filename, f]);
-							deferred.resolve(filename, f);
+							_deferred.resolve(filename, f);
 						}
 
 						writer.onerror = function(e){
 							$(_mfs).trigger('mfs.saveFile.error', [filename, e.toString()]);
-							deferred.reject(filename, e.toString());
+							_deferred.reject(filename, e.toString());
 						}
 
-						var blob = new Blob([fileContent], {type: fileType});
-						writer.write(blob);
+						if ( fileType ) {
+							var blob = new Blob([fileContent], {type: fileType});
+							writer.write(blob);
+						} else {
+							writer.write(fileContent);
+						}
 					}, function(e){
 						$(_mfs).trigger('mfs.saveFile.error', [filename, e]);
-						deferred.reject(filename, e.toString());
+						_deferred.reject(filename, e.toString());
 					});
 				}, function(e){
 					$(_mfs).trigger('mfs.saveFile.error', [filename, e]);
-					deferred.reject(filename, e.toString());
+					_deferred.reject(filename, e.toString());
 				});
 
-				return deferred.promise();
+				return _deferred.promise();
 			},
 
 			saveFile: function(filename, fileContent, fileType){
@@ -256,11 +334,13 @@ var mfs = (function($){
 					return _mfs._saveFile.apply(_mfs, arguments);
 				}
 
+				var saveArguments = arguments;
 				var path = filename.split('/');
-				var deferred = new Deferred();
+				path.pop();// file
+				var deferred = new $.Deferred();
 
-				_mfs.mkdir(path).done(function(path){
-					_mfs._saveFile.apply(_mfs, [arguments]).done(function(fname, f){
+				_mfs.mkdir(path.join('/')).done(function(path){
+					_mfs._saveFile.apply(_mfs, saveArguments).done(function(fname, f){
 						deferred.resolve(filename, f);
 					}).fail(function(){
 						deferred.reject(e);
@@ -274,10 +354,55 @@ var mfs = (function($){
 				return deferred.promise();
 			},
 
+			//TODO: Trigger events
+			getDir: function(path){
+				var deferred = new $.Deferred();
+				_mfs._fs.root.getDir(path).done(function(dirEntry){
+					deferred.resolve(dirEntry);
+				}, function(e){
+					deferred.reject(path, e);
+				});
+				return deferred.promise();
+			},
+			_scandir: function(dir, deferred, files){
+				dir.readEntries(function(results){
+					if ( !results.length ) {
+						deferred.resolve(files);
+						$(_mfs).trigger('mfs.scandir.success', [files]);
+					} else {
+						var r = results || [];
+						files = files.concat(r.slice(0));
+						_mfs._scandir(dir, deferred, files);
+					}
+				}, function(e){
+					deferred.reject(path, e);
+					$(_mfs).trigger('mfs.scandir.error', [path, e]);
+				});
+			},
+			scandir: function(path){
+				var deferred = new $.Deferred();
+				if ( !path || path == "/" ) {
+					var dir = _mfs._fs.root.createReader();
+					_mfs._scandir(dir, deferred, []);
+				} else {
+					_mfs._fs.root.getDirectory(path, {}, function(dirEntry){
+						var dir = dirEntry.createReader();
+						_mfs._scandir(dir, deferred, []);
+					}, function(e){
+						$(_mfs).trigger('mfs.scandir.error', [path, e]);
+						deferred.reject(path, e);
+					});
+				}
+				return deferred.promise();
+			},
+
 			resolveURL: function(url){
+				var deferred = new $.Deferred();
 				window.resolveLocalFileSystemURL(url, function(f){
 					$(_mfs).trigger('mfs.resolveURL.success', [f]);
+					deferred.resolve(f);
 				});
+				return deferred.promise();
 			},
 
 			_mkdir: function(rootDirEntry, folders, fullPath){
@@ -294,11 +419,12 @@ var mfs = (function($){
 				}
 
 				rootDirEntry.getDirectory(folders[0], {create: true}, function(dirEntry) {
+					folders = folders.slice(1);
 					if (folders.length) {
-						_mkdir(dirEntry, folders.slice(1), fullPath);
+						_mfs._mkdir(dirEntry, folders, fullPath);
 					} else {
-						$(_mfs).trigger('mfs.mkdir.success', [dirname]);
-						deferred.resolve(dirname);
+						$(_mfs).trigger('mfs.mkdir.success', [fullPath]);
+						deferred.resolve(fullPath);
 					}
 				}, function(e){
 					$(_mfs).trigger('mfs.mkdir.error', [e]);
@@ -313,13 +439,13 @@ var mfs = (function($){
 				}
 
 				var folders = dirname.split('/');
-				return _mfs._mkdir(fs.root, folders, dirname);
+				return _mfs._mkdir(_mfs._fs.root, folders, dirname);
 			}
 		};
 
 		$.extend(_mfs, options);
 
-		$(_mfs).on('mfs.requestQuota.success', function(e, grantedMB){
+		$(_mfs).on('mfs.requestQuota.success', function(e, grantedMB, usedMb){
 			_mfs._requestFS(grantedMB);
 		});
 
